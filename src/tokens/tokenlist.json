@@ -1,0 +1,16 @@
+{
+    "chainId": 101,
+    "address": "J5kXw6tdzYgyFjaAr7z7ktgTNL7ANZuAE6HgQt2BGedd",
+    "symbol": "B-DOG",
+    "name": "Barx The Dog",
+    "decimals": 9, 
+    "logoURI": "https://i.imgur.com/UT5qmmH.png",
+    "tags": ["meme-token", "community"],
+    "extensions": {
+      "website": "https://barxthedog.com",
+      "twitter": "https://x.com/Barx_the_do",
+      "telegram": "https://t.me/Barxthedog",
+      "discord": "https://discord.gg/VnCz2VvQp6",
+      "description": "Barx is not just a token – it’s a lifestyle."
+    }
+  }
