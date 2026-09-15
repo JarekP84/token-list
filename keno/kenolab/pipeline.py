@@ -77,7 +77,7 @@ def run_full_backtest(df: pd.DataFrame, fast: bool = True,
                       mc_sims: int = MIN_MONTE_CARLO,
                       final_holdout: int = FINAL_HOLDOUT,
                       min_history: int = 1000,
-                      segments=("valid", "test"),
+                      segments=("train", "valid", "test"),
                       max_eval: int | None = None) -> dict:
     """Walk-forward backtest modeli i benchmarkow na VALIDATION i TEST.
 
