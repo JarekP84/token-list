@@ -9,11 +9,25 @@ Założenie metodologiczne: **nie zakładamy, że KENO da się przewidzieć.** S
 narzędziem do falsyfikacji — sprawdza, czy w danych są powtarzalne anomalie, i jeśli ich nie
 ma, mówi to wprost („Nie znaleziono przewagi predykcyjnej”).
 
-## Instalacja
+## Instalacja na macOS (bez wpisywania komend)
+
+1. W Finderze wejdz do katalogu `keno`.
+2. Kliknij dwukrotnie **`install-mac.command`** - sprawdzi Pythona, doinstaluje
+   `libomp` (wymagany przez LightGBM na macOS), utworzy `.venv`, zainstaluje
+   biblioteki i pobierze historie losowan.
+3. Kliknij dwukrotnie **`start-mac.command`** - uruchomi dashboard i otworzy
+   http://127.0.0.1:5000 w przegladarce.
+
+Gdy macOS zablokuje plik ("nie mozna otworzyc, bo pochodzi od
+niezidentyfikowanego dewelopera"): kliknij plik prawym przyciskiem -> *Otworz*
+-> *Otworz*, albo raz wykonaj w Terminalu `xattr -d com.apple.quarantine
+install-mac.command start-mac.command`.
+
+## Instalacja recznie (Linux / macOS / Windows)
 
 ```bash
 cd keno
-python -m venv .venv && source .venv/bin/activate
+python -m venv .venv && source .venv/bin/activate    # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
