@@ -1,8 +1,12 @@
-"""Inzynieria cech dla modeli nadzorowanych.
+"""Inzynieria cech dla modeli nadzorowanych + inkrementalny stan historii.
 
 Dla kazdej pary (losowanie t, liczba j) budujemy wektor cech wyliczony
 WYLACZNIE z losowan < t (brak wycieku informacji z przyszlosci - kluczowe dla
 poprawnosci walk-forward backtestu). Etykieta y = 1, jesli liczba j wypadla w t.
+
+HistoryState trzyma sumy kumulacyjne, indeksy ostatnich trafien i (opcjonalnie)
+macierz wspolwystepowania, dzieki czemu kolejny krok walk-forward kosztuje
+O(70), a nie O(t*70).
 """
 from __future__ import annotations
 
@@ -21,48 +25,80 @@ FEATURE_NAMES = (
 )
 
 
-def running_state(M: np.ndarray) -> dict:
-    """Prekomputacja skumulowanych sum - pozwala liczyc cechy w O(1) na okno."""
-    cs = np.vstack([np.zeros((1, POOL), dtype=np.int64), np.cumsum(M, axis=0)])
-    return {"cumsum": cs}
+class HistoryState:
+    """Inkrementalny stan historii losowan.
+
+    Niezmiennik: po sync(M[:t]) stan opisuje WYLACZNIE losowania o indeksach < t.
+    Skrocenie historii (inny przebieg) powoduje pelny reset - nigdy nie mieszamy
+    stanow z roznych serii danych.
+    """
+
+    def __init__(self, with_cooc: bool = False):
+        self.with_cooc = with_cooc
+        self.cs = np.zeros((1, POOL), dtype=np.int64)    # cs[i] = suma wierszy < i
+        self.last_hit = np.full(POOL, -1, dtype=np.int64)
+        self.n = 0
+        self.C = np.zeros((POOL, POOL), dtype=np.int64) if with_cooc else None
+
+    def sync(self, M: np.ndarray) -> "HistoryState":
+        """Dociaga stan do dlugosci len(M)."""
+        m = len(M)
+        if m < self.n:
+            self.__init__(with_cooc=self.with_cooc)
+        if m == self.n:
+            return self
+        new = M[self.n:m].astype(np.int64)
+        self.cs = np.vstack([self.cs, self.cs[-1] + np.cumsum(new, axis=0)])
+        for off in range(new.shape[0]):
+            idx = np.flatnonzero(new[off])
+            self.last_hit[idx] = self.n + off
+            if self.C is not None:
+                self.C[np.ix_(idx, idx)] += 1
+        self.n = m
+        return self
+
+    # --- odczyty ---------------------------------------------------------- #
+    def window_count(self, t: int, w: int) -> tuple[np.ndarray, int]:
+        """Liczba trafien kazdej liczby w oknie [t-w, t) oraz efektywna dlugosc okna."""
+        lo = max(0, t - w)
+        return (self.cs[t] - self.cs[lo]).astype(float), t - lo
+
+    def total(self, t: int) -> np.ndarray:
+        """Liczba trafien kazdej liczby w losowaniach < t."""
+        return self.cs[t].astype(float)
+
+    def gap(self, t: int) -> np.ndarray:
+        """Aktualna przerwa: ile losowan minelo od ostatniego trafienia przed t."""
+        g = np.where(self.last_hit >= 0, t - 1 - self.last_hit, t).astype(float)
+        return np.maximum(g, 0.0)
 
 
-def _window_count(cs: np.ndarray, t: int, w: int) -> np.ndarray:
-    """Liczba trafien kazdej liczby w oknie [t-w, t)."""
-    lo = max(0, t - w)
-    return (cs[t] - cs[lo]).astype(float), t - lo
+def running_state(M: np.ndarray, with_cooc: bool = False) -> HistoryState:
+    """Buduje stan od zera dla calej historii M."""
+    return HistoryState(with_cooc=with_cooc).sync(M)
 
 
-def features_at(M: np.ndarray, t: int, state: dict, C: np.ndarray | None = None) -> np.ndarray:
+def features_at(M: np.ndarray, t: int, state: HistoryState,
+                C: np.ndarray | None = None) -> np.ndarray:
     """Macierz cech (70 x n_features) dla losowania o indeksie t.
 
-    Uzywa tylko wierszy M[:t]. C - macierz wspolwystepowania policzona na M[:t].
+    Wymaga stanu zsynchronizowanego do dlugosci t; korzysta tylko z M[:t].
     """
-    cs = state["cumsum"]
     cols = []
     for w in ROLL_WINDOWS:
-        cnt, eff = _window_count(cs, t, w)
-        freq = cnt / eff if eff else np.full(POOL, P_SINGLE)
-        cols.append(freq)
+        cnt, eff = state.window_count(t, w)
+        cols.append(cnt / eff if eff else np.full(POOL, P_SINGLE))
     for w in ROLL_WINDOWS:
-        cnt, eff = _window_count(cs, t, w)
-        sd = np.sqrt(eff * P_SINGLE * (1 - P_SINGLE)) if eff else 1.0
+        cnt, eff = state.window_count(t, w)
+        sd = np.sqrt(eff * P_SINGLE * (1 - P_SINGLE)) if eff else 0.0
         cols.append((cnt - eff * P_SINGLE) / sd if sd else np.zeros(POOL))
 
     # --- przerwy ---
-    gap = np.empty(POOL)
-    hist = M[:t]
-    if t == 0:
-        gap[:] = 0
-    else:
-        last_hit = np.where(hist.any(axis=0),
-                            t - 1 - np.argmax(hist[::-1], axis=0), t)
-        gap = (t - 1 - last_hit).astype(float)
-        gap[~hist.any(axis=0)] = t
-    total = cs[t].astype(float)
-    mean_gap = np.divide(t, np.maximum(total, 1), out=np.full(POOL, float(t)), where=total > 0)
-    cols += [gap, gap / max(t, 1), mean_gap,
-             np.divide(gap, np.maximum(mean_gap, 1e-9))]
+    gap = state.gap(t)
+    total = state.total(t)
+    mean_gap = np.divide(t, np.maximum(total, 1), out=np.full(POOL, float(t)),
+                         where=total > 0)
+    cols += [gap, gap / max(t, 1), mean_gap, gap / np.maximum(mean_gap, 1e-9)]
 
     # --- ostatnie losowania ---
     for lag in (1, 2, 3):
@@ -73,9 +109,7 @@ def features_at(M: np.ndarray, t: int, state: dict, C: np.ndarray | None = None)
     for lag in (1, 2):
         if C is not None and t >= lag:
             prev = np.flatnonzero(M[t - lag])
-            sc = C[:, prev].sum(axis=1).astype(float)
-            denom = np.maximum(total, 1)
-            cols.append(sc / denom)
+            cols.append(C[:, prev].sum(axis=1).astype(float) / np.maximum(total, 1))
         else:
             cols.append(np.zeros(POOL))
 
@@ -89,18 +123,15 @@ def build_dataset(M: np.ndarray, start: int, end: int, stride: int = 1,
                   use_cooc: bool = True) -> tuple[np.ndarray, np.ndarray]:
     """Buduje (X, y) dla losowan z przedzialu [start, end).
 
-    Wazne: cechy dla losowania t korzystaja wylacznie z M[:t].
+    Stan jest synchronizowany krok po kroku, wiec cechy dla losowania t
+    korzystaja wylacznie z M[:t] - nie da sie podejrzec przyszlosci.
     """
-    state = running_state(M)
+    st = HistoryState(with_cooc=use_cooc)
     Xs, ys = [], []
-    # macierz wspolwystepowania aktualizowana inkrementalnie (O(400) na krok)
-    C = (M[:start].T.astype(np.int64) @ M[:start].astype(np.int64)) if use_cooc else None
     for t in range(start, end):
-        if t >= start + 1 and use_cooc:
-            v = M[t - 1].astype(np.int64)
-            C += np.outer(v, v)
+        st.sync(M[:t])
         if (t - start) % stride == 0:
-            Xs.append(features_at(M, t, state, C))
+            Xs.append(features_at(M, t, st, st.C if use_cooc else None))
             ys.append(M[t].astype(np.int8))
     if not Xs:
         return np.empty((0, len(FEATURE_NAMES))), np.empty(0, dtype=np.int8)

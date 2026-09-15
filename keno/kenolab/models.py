@@ -15,13 +15,26 @@ from __future__ import annotations
 import numpy as np
 
 from .config import POOL, DRAW_SIZE, P_SINGLE, RANDOM_SEED
-from .features import features_at, running_state, build_dataset
+from .features import HistoryState, features_at, build_dataset
 
 
 class BaseModel:
-    """Wspolna baza modeli."""
+    """Wspolna baza modeli.
+
+    _hist to inkrementalny stan historii (sumy kumulacyjne, ostatnie trafienia),
+    dzieki ktoremu kolejny krok walk-forward kosztuje O(70), nie O(t*70).
+    """
     name = "base"
     refit_every = 1          # co ile krokow walk-forward trenowac od nowa
+    needs_cooc = False
+
+    def __init__(self):
+        self._hist = None
+
+    def _sync(self, M: np.ndarray) -> HistoryState:
+        if self._hist is None:
+            self._hist = HistoryState(with_cooc=self.needs_cooc)
+        return self._hist.sync(M)
 
     def fit(self, M: np.ndarray) -> "BaseModel":
         return self
@@ -60,12 +73,20 @@ class FrequencyModel(BaseModel):
     name = "frequency"
 
     def __init__(self, window: int | None = None, alpha: float = 1.0):
+        super().__init__()
         self.window, self.alpha = window, alpha
 
+    def _counts(self, M):
+        """Zwraca (licznik trafien w oknie, dlugosc okna) na bazie sum kumulacyjnych."""
+        st = self._sync(M)
+        t = len(M)
+        w = self.window or t
+        cnt, eff = st.window_count(t, w)
+        return cnt, max(eff, 1)
+
     def predict_proba(self, M):
-        sub = M if self.window is None else M[-self.window:]
-        n = max(len(sub), 1)
-        return self._normalize((sub.sum(axis=0) + self.alpha) / (n + 2 * self.alpha))
+        cnt, n = self._counts(M)
+        return self._normalize((cnt + self.alpha) / (n + 2 * self.alpha))
 
 
 class ColdModel(FrequencyModel):
@@ -73,10 +94,8 @@ class ColdModel(FrequencyModel):
     name = "cold"
 
     def predict_proba(self, M):
-        sub = M if self.window is None else M[-self.window:]
-        n = max(len(sub), 1)
-        f = (sub.sum(axis=0) + self.alpha) / (n + 2 * self.alpha)
-        return self._normalize(1.0 - f)
+        cnt, n = self._counts(M)
+        return self._normalize(1.0 - (cnt + self.alpha) / (n + 2 * self.alpha))
 
 
 class RecencyModel(BaseModel):
@@ -89,15 +108,27 @@ class RecencyModel(BaseModel):
     name = "recency"
 
     def __init__(self, half_life: float = 100.0, mode: str = "hot"):
+        super().__init__()
         self.half_life, self.mode = half_life, mode
+        self._r = np.exp(-np.log(2) / half_life)   # wspolczynnik zapominania
+        self._S = np.zeros(POOL)                   # nieznormalizowana suma wazona
+        self._W = 0.0                              # suma wag
+        self._n = 0
+
+    def _sync_ewma(self, M):
+        """Aktualizuje EWMA tylko o nowe wiersze: S <- r*S + M_t."""
+        if len(M) < self._n:                       # inna historia -> policz od nowa
+            self._S, self._W, self._n = np.zeros(POOL), 0.0, 0
+        for t in range(self._n, len(M)):
+            self._S = self._r * self._S + M[t]
+            self._W = self._r * self._W + 1.0
+        self._n = len(M)
 
     def predict_proba(self, M):
-        n = len(M)
-        if n == 0:
+        if len(M) == 0:
             return np.full(POOL, P_SINGLE)
-        lam = np.log(2) / self.half_life
-        w = np.exp(-lam * np.arange(n - 1, -1, -1))
-        ewma = (M * w[:, None]).sum(axis=0) / w.sum()
+        self._sync_ewma(M)
+        ewma = self._S / max(self._W, 1e-12)
         if self.mode == "cold":
             return self._normalize(1.0 - ewma)
         return self._normalize(ewma)
@@ -115,10 +146,9 @@ class GapModel(BaseModel):
         n = len(M)
         if n == 0:
             return np.full(POOL, P_SINGLE)
-        hit_any = M.any(axis=0)
-        last = np.where(hit_any, n - 1 - np.argmax(M[::-1], axis=0), -1)
-        gap = (n - 1 - last).astype(float)
-        counts = M.sum(axis=0).astype(float)
+        st = self._sync(M)
+        gap = st.gap(n)
+        counts = st.total(n)
         mean_gap = np.divide(n, np.maximum(counts, 1), out=np.full(POOL, float(n)),
                              where=counts > 0)
         return self._normalize(gap / np.maximum(mean_gap, 1e-9) + 1e-6)
@@ -129,19 +159,20 @@ class CooccurrenceModel(BaseModel):
     ktore wypadly w poprzednim losowaniu (lift wzgledem oczekiwania)."""
     name = "cooccurrence"
 
+    needs_cooc = True
+
     def __init__(self, lags: tuple[int, ...] = (1, 2)):
+        super().__init__()
         self.lags = lags
         self.C = None
 
     def fit(self, M):
-        self.C = M.T.astype(np.int64) @ M.astype(np.int64)
-        self.counts = M.sum(axis=0).astype(float)
-        self.n = len(M)
+        st = self._sync(M)                 # aktualizuje C tylko o nowe wiersze
+        self.C, self.n = st.C, len(M)
         return self
 
     def predict_proba(self, M):
-        if self.C is None:
-            self.fit(M)
+        self.fit(M)
         score = np.zeros(POOL)
         p_pair = (DRAW_SIZE / POOL) * ((DRAW_SIZE - 1) / (POOL - 1))
         for lag in self.lags:
@@ -168,12 +199,14 @@ class SupervisedModel(BaseModel):
     """
     name = "supervised"
 
+    needs_cooc = True
+
     def __init__(self, train_span: int = 5000, stride: int = 1,
                  refit_every: int = 250, seed: int = RANDOM_SEED):
+        super().__init__()
         self.train_span, self.stride = train_span, stride
         self.refit_every, self.seed = refit_every, seed
         self.clf = None
-        self._C = None
 
     def _make_clf(self):
         raise NotImplementedError
@@ -181,23 +214,21 @@ class SupervisedModel(BaseModel):
     def fit(self, M):
         end = len(M)
         start = max(1, end - self.train_span)
+        # osobny stan treningowy: build_dataset synchronizuje go krok po kroku,
+        # wiec zadna cecha nie widzi losowania, ktore przewiduje
         X, y = build_dataset(M, start, end, stride=self.stride)
         if len(np.unique(y)) < 2 or len(X) < 100:
             self.clf = None
             return self
         self.clf = self._make_clf()
         self.clf.fit(X, y)
-        self._C = M.T.astype(np.int64) @ M.astype(np.int64)
         return self
 
     def predict_proba(self, M):
         if self.clf is None:
             return np.full(POOL, P_SINGLE)
-        C = self._C if self._C is not None else M.T.astype(np.int64) @ M.astype(np.int64)
-        # cechy dla losowania o indeksie len(M), czyli nastepnego po historii M;
-        # doklejamy pusty wiersz, bo features_at indeksuje M[:t]
-        Mx = np.vstack([M, np.zeros((1, POOL), dtype=M.dtype)])
-        X = features_at(Mx, len(M), running_state(Mx), C)
+        st = self._sync(M)          # stan opisuje wylacznie losowania < len(M)
+        X = features_at(M, len(M), st, st.C)
         return self.clf.predict_proba(X)[:, 1]
 
 
