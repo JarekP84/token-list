@@ -1,0 +1,6 @@
+data/*.sqlite
+data/*.csv
+reports/*.csv
+__pycache__/
+*.pyc
+.venv/
